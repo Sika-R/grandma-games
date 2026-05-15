@@ -39,6 +39,9 @@ export class Shooter extends Component {
     // 鼠标移动/移出 canvas 等场景误触 TOUCH_END/TOUCH_CANCEL）
     private pressed: boolean = false;
 
+    // 游戏结束 / 暂停时锁住，不再接受输入
+    private locked: boolean = false;
+
     init(deps: ShooterDeps) {
         this.deps = deps;
         this.spawnNextBubble();
@@ -49,6 +52,15 @@ export class Shooter extends Component {
     // 允许 BubbleGame 在 init 之后再注入 fx（fx 节点是在 shooter 之后创建的）
     attachFX(fx: BubbleFX) {
         if (this.deps) this.deps.fx = fx;
+    }
+
+    // 锁定/解锁输入：游戏结束、暂停、结算面板期间禁止发射
+    setLocked(locked: boolean) {
+        this.locked = locked;
+        if (locked) {
+            this.aimGraphics?.clear();
+            this.pressed = false;
+        }
     }
 
     onLoad() {
@@ -92,11 +104,13 @@ export class Shooter extends Component {
     }
 
     private onPressStart(e: EventTouch) {
+        if (this.locked) return;
         this.pressed = true;
         this.updateAim(e);
     }
 
     private onPressEnd(e: EventTouch) {
+        if (this.locked) return;
         if (!this.pressed) return;          // 没按下过，忽略（防误触发）
         this.pressed = false;
         this.fire(e);
@@ -116,6 +130,7 @@ export class Shooter extends Component {
     }
 
     private updateAim(e: EventTouch | EventMouse) {
+        if (this.locked) return;
         // ⚠️ 关键：getUILocation() 返回 UI 屏幕坐标（原点在屏幕左下角）
         //    但 node.getWorldPosition() 是世界坐标（原点在画布中心）
         //    必须减去 visibleSize/2 把 UI 坐标转成世界坐标，否则瞄准方向永远偏一个角度

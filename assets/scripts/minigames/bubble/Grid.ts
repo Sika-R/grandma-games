@@ -1,4 +1,4 @@
-import { _decorator, Component, Node, Vec3, UITransform, Layers, Graphics, Color } from 'cc';
+import { _decorator, Component, Node, Vec3, UITransform, Layers, Graphics, Color, tween } from 'cc';
 import { BubbleConfig, rowHeight } from './BubbleConfig';
 import { Bubble } from './Bubble';
 import { BubbleColor, randomBubbleColor } from './BubbleType';
@@ -48,9 +48,10 @@ export class Grid extends Component {
         return arr;
     }
 
-    // 偶数行 cols 个，奇数行 cols - 1 个（保持视觉宽度对齐）
-    colCount(row: number): number {
-        return row % 2 === 0 ? this.cols : this.cols - 1;
+    // 简化：所有行都放 cols 颗（奇数行 X 偏移 r）
+    // 老的"奇数行少一颗"方案在 pushdown 时会因 row 奇偶翻转导致最右一颗无处可去，逻辑复杂
+    colCount(_row: number): number {
+        return this.cols;
     }
 
     // 网格坐标 → 本节点局部坐标（Y 向下递增，所以返回的 y 是负值）
@@ -205,6 +206,79 @@ export class Grid extends Component {
         if (!b) return;
         this.cells[row][col] = null;
         b.dropOut().then(() => b.node.destroy());
+    }
+
+    // ============ Day 7：无尽下推 + 胜负检测 ============
+
+    // 顶部新增一行，所有现有泡泡向下移一格（行索引 +1，世界 Y 减 rowHeight）
+    // 因为 row 奇偶翻转，X 也要补偿 ±r
+    pushDownOneRow() {
+        const rh = rowHeight();
+        const r = BubbleConfig.BUBBLE_RADIUS;
+
+        // 1) 现有泡泡：动画移到新位置，更新 row
+        for (let row = 0; row < this.cells.length; row++) {
+            const oldOffset = row % 2 === 0 ? 0 : r;
+            const newOffset = (row + 1) % 2 === 0 ? 0 : r;
+            const xShift = newOffset - oldOffset;
+            for (let col = 0; col < this.cells[row].length; col++) {
+                const b = this.cells[row][col];
+                if (!b) continue;
+                b.row = row + 1;
+                const oldPos = b.node.position;
+                const newPos = new Vec3(oldPos.x + xShift, oldPos.y - rh, 0);
+                tween(b.node).to(0.35, { position: newPos }, { easing: 'cubicInOut' }).start();
+            }
+        }
+
+        // 2) 数据结构：在 cells 头部插入新行
+        const newTopRow: (Bubble | null)[] = new Array(this.cols).fill(null);
+        for (let col = 0; col < this.cols; col++) {
+            const pos = this.gridToLocal(0, col);
+            const b = Bubble.create(this.node, randomBubbleColor(), pos);
+            b.row = 0;
+            b.col = col;
+            // 入场动画：从更上方滑下来
+            const startPos = new Vec3(pos.x, pos.y + rh, 0);
+            b.node.setPosition(startPos);
+            tween(b.node).to(0.35, { position: pos }, { easing: 'cubicInOut' }).start();
+            newTopRow[col] = b;
+        }
+        this.cells.unshift(newTopRow);
+    }
+
+    // 网格里最低（世界 Y 最小）的泡泡 Y 坐标。用于触底判定
+    getLowestBubbleWorldY(): number {
+        let minY = Infinity;
+        const gridWorldY = this.node.getWorldPosition().y;
+        for (const row of this.cells) {
+            for (const b of row) {
+                if (!b) continue;
+                const worldY = gridWorldY + b.node.position.y;
+                if (worldY < minY) minY = worldY;
+            }
+        }
+        return minY;
+    }
+
+    // 网格里有没有泡泡（用于胜利判定）
+    isEmpty(): boolean {
+        for (const row of this.cells) {
+            for (const b of row) {
+                if (b) return false;
+            }
+        }
+        return true;
+    }
+
+    // 清空所有泡泡（用于重开）
+    clearAll() {
+        for (const row of this.cells) {
+            for (const b of row) {
+                if (b) b.node.destroy();
+            }
+        }
+        this.cells = [];
     }
 
     // BFS 找出与 (row,col) 同色相连的所有泡泡（含自己）

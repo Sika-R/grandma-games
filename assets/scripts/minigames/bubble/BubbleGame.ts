@@ -1,6 +1,6 @@
-import { _decorator, Component, Node, Vec3, UITransform, Layers, Color, view, director, Graphics, Camera, Canvas } from 'cc';
+import { _decorator, Component, Node, Vec3, UITransform, Layers, Color, view, director, Graphics, Camera, Canvas, Label, UIOpacity, tween } from 'cc';
 import { MiniGameBase } from '../../core/MiniGameBase';
-import { BubbleConfig, computeGridCols, computeBubbleRadius, computeShootSpeed } from './BubbleConfig';
+import { BubbleConfig, computeGridCols, computeBubbleRadius, computeShootSpeed, rowHeight } from './BubbleConfig';
 import { Grid } from './Grid';
 import { Shooter } from './Shooter';
 import { Bubble } from './Bubble';
@@ -12,8 +12,13 @@ import { ensureCanvas, ensureUITransform, createButton, createLabelNode } from '
 
 const { ccclass } = _decorator;
 
+// 每隔多少次发射，顶部下推一行（无尽模式压力）
+const FIRES_PER_PUSHDOWN = 6;
+
+// 顶部 HUD 占用的高度（design 像素）—— 网格从这下面开始放，避免与 HUD 重叠
+const HUD_HEIGHT = 220;
+
 // 泡泡龙主控
-// 在 Cocos 编辑器里：BubbleShooter 场景根节点挂一个空节点 "Bootstrap"，挂上本组件
 @ccclass('BubbleGame')
 export class BubbleGame extends MiniGameBase {
     get gameId() { return 'bubble'; }
@@ -21,9 +26,36 @@ export class BubbleGame extends MiniGameBase {
     private grid: Grid | null = null;
     private fx: BubbleFX | null = null;
     private worldNode: Node | null = null;
+    private canvasNode: Node | null = null;
+    private shooter: Shooter | null = null;
+
+    // HUD
+    private scoreLabel: Label | null = null;
+    private pushdownLabel: Label | null = null;
+
+    // 游戏状态
+    private score: number = 0;
+    private firesUntilPushdown: number = FIRES_PER_PUSHDOWN;
+    private gameOver: boolean = false;
+    private startedAt: number = 0;
+
+    // 触底失败的世界 Y 阈值；任何泡泡 worldY < 这个就 GG
+    private dangerLineY: number = 0;
+
+    // 初始网格 cols（重开用）
+    private initialCols: number = 11;
 
     startGame() {
-        // Day 6 起会有更多初始化（重置网格、计分归零等）。当前 onLoad 已搭建场景，此处暂留空。
+        if (!this.grid || !this.shooter) return;
+        this.grid.clearAll();
+        this.grid.fillInitial(BubbleConfig.INITIAL_ROWS, this.initialCols);
+        this.score = 0;
+        this.firesUntilPushdown = FIRES_PER_PUSHDOWN;
+        this.gameOver = false;
+        this.startedAt = Date.now();
+        this.refreshScoreLabel();
+        this.refreshPushdownLabel();
+        this.shooter.setLocked(false);
     }
 
     onLoad() {
@@ -33,13 +65,12 @@ export class BubbleGame extends MiniGameBase {
         ensureUITransform(this.node).setContentSize(visible);
 
         // ⚠️ 关键：先按屏幕实际像素重算泡泡半径和飞行速度，让游戏在不同分辨率屏幕上感受一致
-        //    （老人看得清；不至于在窄屏幕上变得很小或飞得很慢）
-        //    必须在创建任何泡泡/网格之前完成
         BubbleConfig.BUBBLE_RADIUS = computeBubbleRadius();
         BubbleConfig.SHOOT_SPEED = computeShootSpeed();
 
         // === Camera + Canvas ===
         const canvasNode = ensureCanvas(this.node);
+        this.canvasNode = canvasNode;
 
         // === 背景 ===
         const bg = new Node('BG');
@@ -62,19 +93,17 @@ export class BubbleGame extends MiniGameBase {
         const gridNode = new Node('Grid');
         gridNode.layer = Layers.Enum.UI_2D;
         ensureUITransform(gridNode);
-        // 根据屏幕宽度动态算列数 → 让泡泡占满整屏宽度
         const r = BubbleConfig.BUBBLE_RADIUS;
         const cols = computeGridCols(visible.width);
-        // 居中放置：偶数行的中心点对齐 x=0
+        this.initialCols = cols;
         const gridOriginX = -(cols - 1) * r;
-        const gridOriginY = visible.height / 2 - r * 2;
+        // 网格起点 Y：从 HUD 区域下方 r 开始（让 row 0 顶边刚好贴在 HUD 区域底）
+        const gridOriginY = visible.height / 2 - HUD_HEIGHT - r;
         gridNode.setPosition(gridOriginX, gridOriginY, 0);
         world.addChild(gridNode);
         const grid = gridNode.addComponent(Grid);
         grid.fillInitial(BubbleConfig.INITIAL_ROWS, cols);
         this.grid = grid;
-        const frame = view.getFrameSize();
-        console.log(`[BubbleGame] visible=${visible.width}x${visible.height}, frame=${frame.width}x${frame.height}, radius=${BubbleConfig.BUBBLE_RADIUS.toFixed(1)}, cols=${cols}, gridChildren=${gridNode.children.length}`);
 
         // === Shooter ===
         const shooterNode = new Node('Shooter');
@@ -94,108 +123,320 @@ export class BubbleGame extends MiniGameBase {
             grid: grid,
             onBubbleLand: (b, worldPos) => this.handleBubbleLand(b, worldPos),
         });
+        this.shooter = shooter;
 
-        // === FX Layer（颗粒、飘字、闪光等都加到这层；放在 world 内最上层，
-        //     这样震屏时 FX 跟随 world 一起动，UI 按钮不动）===
+        // === 危险线（在 shooter 上方 r*3）：泡泡碰到这条线就 GG ===
+        this.dangerLineY = shooterY + r * 3;
+        this.drawDangerLine(world, this.dangerLineY, visible.width);
+
+        // === FX Layer（颗粒、飘字、闪光等）===
         const fxNode = new Node('FX');
         fxNode.layer = Layers.Enum.UI_2D;
         ensureUITransform(fxNode);
         world.addChild(fxNode);
         this.fx = fxNode.addComponent(BubbleFX);
-
-        // 把 fx 传给 shooter（飞行轨迹、枪口火）
-        // 注意：shooter 已经创建过；这里不能修改 deps，所以我们调一个 setter
         shooter.attachFX(this.fx);
+
+        // === 顶部 HUD：分数 + 下推倒计时 ===
+        this.buildHUD(canvasNode, visible);
 
         // === 返回按钮（左上）===
         const back = createButton('返回', 140, 60, () => {
             director.loadScene(SceneName.MAIN);
         }, new Color(80, 80, 100));
-        back.setPosition(-visible.width / 2 + 90, visible.height / 2 - 50, 0);
+        back.setPosition(-visible.width / 2 + 90, visible.height / 2 - 60, 0);
         canvasNode.addChild(back);
 
-        // === 标题（顶中）===
-        const title = createLabelNode('泡泡龙', 36, new Color(255, 255, 255));
-        title.setPosition(0, visible.height / 2 - 50, 0);
-        canvasNode.addChild(title);
+        const frame = view.getFrameSize();
+        console.log(`[BubbleGame] visible=${visible.width}x${visible.height}, frame=${frame.width}x${frame.height}, radius=${BubbleConfig.BUBBLE_RADIUS.toFixed(1)}, cols=${cols}`);
 
         this.startGame();
     }
 
+    private buildHUD(parent: Node, visible: { width: number; height: number }) {
+        // HUD 区域占顶部 HUD_HEIGHT 高度。中心 Y = top - HUD_HEIGHT/2
+        const top = visible.height / 2;
+
+        // 分数（顶中，大字）
+        const scoreNode = createLabelNode('0', 64, new Color(255, 230, 100));
+        scoreNode.setPosition(0, top - 100, 0);
+        parent.addChild(scoreNode);
+        this.scoreLabel = scoreNode.getComponent(Label);
+
+        // 下推倒计时（分数下方小字）
+        const pdNode = createLabelNode('', 28, new Color(180, 180, 200));
+        pdNode.setPosition(0, top - 170, 0);
+        parent.addChild(pdNode);
+        this.pushdownLabel = pdNode.getComponent(Label);
+    }
+
+    private drawDangerLine(parent: Node, y: number, width: number) {
+        const n = new Node('DangerLine');
+        n.layer = Layers.Enum.UI_2D;
+        ensureUITransform(n);
+        const g = n.addComponent(Graphics);
+        g.lineWidth = 3;
+        g.strokeColor = new Color(220, 80, 80, 200);
+        // 虚线
+        const dash = 24;
+        const gap = 16;
+        let x = -width / 2;
+        while (x < width / 2) {
+            g.moveTo(x, y);
+            g.lineTo(Math.min(x + dash, width / 2), y);
+            x += dash + gap;
+        }
+        g.stroke();
+        parent.addChild(n);
+    }
+
+    private refreshScoreLabel() {
+        if (this.scoreLabel) this.scoreLabel.string = String(this.score);
+    }
+
+    private refreshPushdownLabel() {
+        if (this.pushdownLabel) {
+            this.pushdownLabel.string = `${this.firesUntilPushdown} 发后下压`;
+        }
+    }
+
+    // 计分滚动动画：从 from 滚到 to
+    private animateScoreTo(from: number, to: number, durationMs: number = 350) {
+        if (!this.scoreLabel) {
+            this.score = to;
+            this.refreshScoreLabel();
+            return;
+        }
+        const lbl = this.scoreLabel;
+        const start = Date.now();
+        const tick = () => {
+            const elapsed = Date.now() - start;
+            const t = Math.min(1, elapsed / durationMs);
+            const v = Math.floor(from + (to - from) * t);
+            lbl.string = String(v);
+            if (t < 1) {
+                requestAnimationFrame(tick);
+            } else {
+                lbl.string = String(to);
+            }
+        };
+        requestAnimationFrame(tick);
+    }
+
     // 飞行泡泡触发吸附 → 找空格落位 → 同色 BFS 消除 → 悬空掉落
-    // 全部反馈通过 fx 模块和 EventBus 广播
     private handleBubbleLand(b: Bubble, worldPos: Vec3) {
         if (!this.grid || !this.fx) return;
+        if (this.gameOver) {
+            b.node.destroy();
+            return;
+        }
         const cell = this.grid.findNearestEmptyCell(worldPos);
         if (!cell) {
             b.node.destroy();
             return;
         }
 
-        // 落位（addBubble 内部会触发 landSquash 弹一下）
+        // 落位
         this.grid.addBubble(b, cell.row, cell.col);
         EventBus.emit('bubble.landed', { row: cell.row, col: cell.col, color: b.color });
         AudioManager.playSfx('land');
 
         // 同色 3+ 消除
         const cluster = this.grid.findColorCluster(cell.row, cell.col);
-        if (cluster.length < 3) return;
-
-        // 关键：先在数据还在的时候采集每颗泡泡的世界位置 + 颜色，给 FX 用
-        const eliminated: { pos: Vec3; color: Color }[] = [];
-        for (const c of cluster) {
-            const eb = this.grid.getCell(c.row, c.col);
-            if (!eb) continue;
-            eliminated.push({
-                pos: eb.node.getWorldPosition().clone(),
-                color: BubbleConfig.COLOR_PALETTE[eb.color],
-            });
-        }
-
-        const centerPos = this.averagePos(eliminated.map(e => e.pos));
-        const score = this.scoreFor(cluster.length);
-
-        // ==== 反馈分三档：3-4 / 5-6 / 7+ ====
-        // 基础（所有消除都有）
-        for (const e of eliminated) {
-            this.fx.burst(e.pos, e.color);
-        }
-        for (const c of cluster) {
-            this.grid.removeBubble(c.row, c.col, true);
-        }
-        this.fx.flash(centerPos, BubbleConfig.BUBBLE_RADIUS * 1.6);
-        this.fx.shockwave(centerPos, eliminated[0].color, BubbleConfig.BUBBLE_RADIUS * (3 + cluster.length * 0.4));
-
-        // 中型（≥5）：顿帧 + 镜头冲击 + 段位飘字
-        if (cluster.length >= 5) {
-            this.fx.hitStop(70);
-            if (this.worldNode) {
-                this.fx.worldPunch(this.worldNode, 0.04, 280);
-                this.fx.screenShake(this.worldNode, 14, 280);
+        let droppedCount = 0;
+        if (cluster.length >= 3) {
+            // 采集位置 + 颜色 给 FX
+            const eliminated: { pos: Vec3; color: Color }[] = [];
+            for (const c of cluster) {
+                const eb = this.grid.getCell(c.row, c.col);
+                if (!eb) continue;
+                eliminated.push({
+                    pos: eb.node.getWorldPosition().clone(),
+                    color: BubbleConfig.COLOR_PALETTE[eb.color],
+                });
             }
-            this.fx.comboText(this.comboLabel(cluster.length), centerPos, this.comboColor(cluster.length));
-        } else {
-            // 普通飘字
-            this.fx.scorePopup(`+${score}`, centerPos);
+            const centerPos = this.averagePos(eliminated.map(e => e.pos));
+            const eliminationScore = this.scoreFor(cluster.length);
+
+            // 反馈分档
+            for (const e of eliminated) this.fx.burst(e.pos, e.color);
+            for (const c of cluster) this.grid.removeBubble(c.row, c.col, true);
+            this.fx.flash(centerPos, BubbleConfig.BUBBLE_RADIUS * 1.6);
+            this.fx.shockwave(centerPos, eliminated[0].color, BubbleConfig.BUBBLE_RADIUS * (3 + cluster.length * 0.4));
+
+            if (cluster.length >= 5) {
+                this.fx.hitStop(70);
+                if (this.worldNode) {
+                    this.fx.worldPunch(this.worldNode, 0.04, 280);
+                    this.fx.screenShake(this.worldNode, 14, 280);
+                }
+                this.fx.comboText(this.comboLabel(cluster.length), centerPos, this.comboColor(cluster.length));
+            } else {
+                this.fx.scorePopup(`+${eliminationScore}`, centerPos);
+            }
+
+            if (cluster.length >= 7) {
+                this.fx.bgFlash(eliminated[0].color, 110, 280);
+            }
+
+            EventBus.emit('bubble.eliminated', { count: cluster.length, score: eliminationScore });
+            AudioManager.playSfx(cluster.length >= 5 ? 'big_pop' : 'pop');
+
+            // 悬空掉落（每颗也算分）
+            const floating = this.grid.findFloatingBubbles();
+            for (const f of floating) this.grid.dropBubble(f.row, f.col);
+            droppedCount = floating.length;
+            if (droppedCount > 0) {
+                EventBus.emit('bubble.dropped', { count: droppedCount });
+                AudioManager.playSfx('drop');
+            }
+
+            // 累计计分
+            const totalGain = eliminationScore + droppedCount * 20;
+            this.animateScoreTo(this.score, this.score + totalGain);
+            this.score += totalGain;
         }
 
-        // 大型（≥7）：再加全屏一闪
-        if (cluster.length >= 7) {
-            this.fx.bgFlash(eliminated[0].color, 110, 280);
+        // 每发都计入下推倒计时
+        this.firesUntilPushdown -= 1;
+        if (this.firesUntilPushdown <= 0) {
+            this.firesUntilPushdown = FIRES_PER_PUSHDOWN;
+            this.grid.pushDownOneRow();
+            AudioManager.playSfx('pushdown');
         }
+        this.refreshPushdownLabel();
 
-        EventBus.emit('bubble.eliminated', { count: cluster.length, score });
-        AudioManager.playSfx(cluster.length >= 5 ? 'big_pop' : 'pop');
+        // 胜利 / 失败判定
+        // 胜利：网格清空（grid.isEmpty 不算正在动画掉落的）
+        if (this.grid.isEmpty()) {
+            this.endGameWithResult(true);
+            return;
+        }
+        // 失败：最低泡泡 worldY 已低于危险线
+        // 注意：pushDownOneRow 是异步动画，但数据上 row 已经 +1，最低 Y 实际上还没动到位
+        // 用"数据 row × rowHeight"算理论位置（更严格，提前判定）
+        if (this.checkLoseTheoretical()) {
+            this.endGameWithResult(false);
+            return;
+        }
+    }
 
-        // 悬空掉落
-        const floating = this.grid.findFloatingBubbles();
-        for (const f of floating) {
-            this.grid.dropBubble(f.row, f.col);
+    private checkLoseTheoretical(): boolean {
+        if (!this.grid) return false;
+        // 找最大 row 索引（最下面那行有泡泡的）
+        let maxRow = -1;
+        for (let row = this.grid.rowCount() - 1; row >= 0; row--) {
+            for (let col = 0; col < this.initialCols; col++) {
+                if (this.grid.getCell(row, col)) {
+                    maxRow = row;
+                    break;
+                }
+            }
+            if (maxRow >= 0) break;
         }
-        if (floating.length > 0) {
-            EventBus.emit('bubble.dropped', { count: floating.length });
-            AudioManager.playSfx('drop');
+        if (maxRow < 0) return false;
+        const gridWorldY = this.grid.node.getWorldPosition().y;
+        const lowestY = gridWorldY - maxRow * rowHeight();
+        return lowestY < this.dangerLineY;
+    }
+
+    private endGameWithResult(success: boolean) {
+        if (this.gameOver) return;
+        this.gameOver = true;
+        if (this.shooter) this.shooter.setLocked(true);
+
+        // 上报结果给核心层（写存档 + 发奖励金币）
+        const duration = Date.now() - this.startedAt;
+        this.endGame({ success, score: this.score, duration });
+
+        this.showEndPanel(success);
+    }
+
+    private showEndPanel(success: boolean) {
+        if (!this.canvasNode) return;
+        const visible = view.getVisibleSize();
+
+        // 半透明遮罩
+        const overlay = new Node('EndOverlay');
+        overlay.layer = Layers.Enum.UI_2D;
+        ensureUITransform(overlay).setContentSize(visible);
+        const og = overlay.addComponent(Graphics);
+        og.fillColor = new Color(0, 0, 0, 180);
+        og.rect(-visible.width / 2, -visible.height / 2, visible.width, visible.height);
+        og.fill();
+        const ovOp = overlay.addComponent(UIOpacity);
+        ovOp.opacity = 0;
+        // 拦截下方的触摸（任意 click 不会穿透到游戏）
+        overlay.on(Node.EventType.TOUCH_END, () => { /* 吞掉 */ });
+        this.canvasNode.addChild(overlay);
+        tween(ovOp).to(0.25, { opacity: 220 }).start();
+
+        // 中心面板
+        const panel = new Node('EndPanel');
+        panel.layer = Layers.Enum.UI_2D;
+        const panelW = Math.min(visible.width * 0.8, 720);
+        const panelH = panelW * 0.7;
+        ensureUITransform(panel).setContentSize(panelW, panelH);
+        const pg = panel.addComponent(Graphics);
+        pg.fillColor = new Color(40, 50, 80, 240);
+        pg.roundRect(-panelW / 2, -panelH / 2, panelW, panelH, 28);
+        pg.fill();
+        pg.lineWidth = 4;
+        pg.strokeColor = success ? new Color(120, 220, 120) : new Color(220, 120, 120);
+        pg.roundRect(-panelW / 2, -panelH / 2, panelW, panelH, 28);
+        pg.stroke();
+        overlay.addChild(panel);
+
+        // 标题
+        const titleText = success ? '通关!' : '游戏结束';
+        const titleColor = success ? new Color(150, 240, 150) : new Color(240, 150, 150);
+        const titleNode = createLabelNode(titleText, 80, titleColor);
+        titleNode.setPosition(0, panelH * 0.28, 0);
+        panel.addChild(titleNode);
+
+        // 分数
+        const scoreNode = createLabelNode(`得分: ${this.score}`, 56, new Color(255, 230, 100));
+        scoreNode.setPosition(0, panelH * 0.05, 0);
+        panel.addChild(scoreNode);
+
+        // 按钮：再来一次 / 返回
+        const btnW = panelW * 0.4;
+        const btnH = 90;
+        const btnY = -panelH * 0.28;
+
+        const restartBtn = createButton('再来一次', btnW, btnH, () => {
+            this.fadeOutEndPanel(overlay, () => this.startGame());
+        }, new Color(80, 140, 220));
+        restartBtn.setPosition(-panelW * 0.22, btnY, 0);
+        panel.addChild(restartBtn);
+
+        const backBtn = createButton('返回', btnW, btnH, () => {
+            director.loadScene(SceneName.MAIN);
+        }, new Color(100, 100, 120));
+        backBtn.setPosition(panelW * 0.22, btnY, 0);
+        panel.addChild(backBtn);
+
+        // 入场动画：缩放 0.5 → 1
+        panel.setScale(0.5, 0.5, 1);
+        tween(panel)
+            .to(0.35, { scale: new Vec3(1, 1, 1) }, { easing: 'backOut' })
+            .start();
+    }
+
+    private fadeOutEndPanel(overlay: Node, onDone: () => void) {
+        const op = overlay.getComponent(UIOpacity);
+        if (!op) {
+            overlay.destroy();
+            onDone();
+            return;
         }
+        tween(op)
+            .to(0.2, { opacity: 0 })
+            .call(() => {
+                overlay.destroy();
+                onDone();
+            })
+            .start();
     }
 
     private scoreFor(clusterSize: number): number {
@@ -209,9 +450,9 @@ export class BubbleGame extends MiniGameBase {
     }
 
     private comboColor(clusterSize: number): Color {
-        if (clusterSize >= 9) return new Color(255, 80, 80);     // 红
-        if (clusterSize >= 7) return new Color(255, 160, 60);    // 橙
-        return new Color(255, 220, 80);                          // 黄
+        if (clusterSize >= 9) return new Color(255, 80, 80);
+        if (clusterSize >= 7) return new Color(255, 160, 60);
+        return new Color(255, 220, 80);
     }
 
     private averagePos(positions: Vec3[]): Vec3 {

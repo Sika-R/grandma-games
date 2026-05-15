@@ -1,8 +1,9 @@
-import { _decorator, Component, Node, Vec3, Vec2, UITransform, Layers, Graphics, Color, EventTouch, EventMouse, input, Input, Camera, view } from 'cc';
+import { _decorator, Component, Node, Vec3, Vec2, UITransform, Layers, Graphics, Color, EventTouch, EventMouse, input, Input, Camera, view, tween } from 'cc';
 import { BubbleConfig } from './BubbleConfig';
 import { Bubble } from './Bubble';
 import { BubbleColor, randomBubbleColor } from './BubbleType';
 import { Grid } from './Grid';
+import { BubbleFX } from './BubbleFX';
 
 const { ccclass } = _decorator;
 
@@ -17,6 +18,7 @@ interface ShooterDeps {
     bounds: ShooterBounds;
     grid: Grid;             // 用于碰撞检测和顶部边界
     onBubbleLand: (b: Bubble, worldPos: Vec3) => void;  // 飞行泡泡需要吸附时回调
+    fx?: BubbleFX;          // 可选：传入用于轨迹/枪口火等特效
 }
 
 // 发射器 Component。挂在 Shooter 节点上（节点位置 = 发射点）
@@ -42,6 +44,11 @@ export class Shooter extends Component {
         this.spawnNextBubble();
         const wp = this.node.getWorldPosition();
         console.log(`[Shooter] init: worldPos=(${wp.x.toFixed(1)}, ${wp.y.toFixed(1)}), bounds=${JSON.stringify(deps.bounds)}`);
+    }
+
+    // 允许 BubbleGame 在 init 之后再注入 fx（fx 节点是在 shooter 之后创建的）
+    attachFX(fx: BubbleFX) {
+        if (this.deps) this.deps.fx = fx;
     }
 
     onLoad() {
@@ -153,25 +160,48 @@ export class Shooter extends Component {
 
         const speed = BubbleConfig.SHOOT_SPEED;
         b.velocity = { x: this.aimDirection.x * speed, y: this.aimDirection.y * speed };
+        // 记录上次 spawn trail 的位置，用于按距离间隔生成轨迹点
+        b.lastTrailPos = b.node.getWorldPosition().clone();
         this.flying.push(b);
 
         // 清掉瞄准线
         this.aimGraphics?.clear();
 
+        // 反馈：枪口火 + 发射器后坐力
+        if (this.deps.fx) {
+            const muzzleColor = BubbleConfig.COLOR_PALETTE[b.color];
+            this.deps.fx.muzzleFlash(shooterPos, muzzleColor);
+        }
+        this.recoilSquash();
+
         // 上膛下一颗
         this.spawnNextBubble();
+    }
+
+    // 发射后底座短暂下压再回弹
+    private recoilSquash() {
+        const orig = new Vec3(1, 1, 1);
+        tween(this.node)
+            .to(0.06, { scale: new Vec3(1.15, 0.85, 1) }, { easing: 'cubicOut' })
+            .to(0.18, { scale: orig }, { easing: 'elasticOut' })
+            .start();
     }
 
     update(dt: number) {
         if (!this.deps) return;
         const bounds = this.deps.bounds;
         const grid = this.deps.grid;
+        const fx = this.deps.fx;
         const r = BubbleConfig.BUBBLE_RADIUS;
-        // 碰撞距离：略小于 2r，让吸附在轻微重叠时触发，视觉更自然
-        const collideDist2 = (2 * r * 0.92) ** 2;
+        // 碰撞距离：球心到球心 = 直径 (2r)。连续碰撞 (CCD) 下不需要 buffer
+        const collideR = 2 * r;
+        const collideR2 = collideR * collideR;
         const gridTopY = grid.getTopWorldY();
-        // 缓存所有网格泡泡的世界坐标，避免循环里频繁读
+        // 缓存所有网格泡泡的世界坐标
         const gridBubbles = grid.getAllBubbles();
+        // 飞行轨迹：每移动 trailGapPx 像素 spawn 一个尾迹点
+        const trailGapPx = r * 0.7;
+        const trailGap2 = trailGapPx * trailGapPx;
 
         for (let i = this.flying.length - 1; i >= 0; i--) {
             const b = this.flying[i];
@@ -179,51 +209,92 @@ export class Shooter extends Component {
                 this.flying.splice(i, 1);
                 continue;
             }
-            const pos = b.node.position;
-            let nx = pos.x + b.velocity.x * dt;
-            let ny = pos.y + b.velocity.y * dt;
+            const startX = b.node.position.x;
+            const startY = b.node.position.y;
+            let endX = startX + b.velocity.x * dt;
+            let endY = startY + b.velocity.y * dt;
 
-            // 左右墙反弹
-            if (nx < bounds.leftX + r) {
-                nx = bounds.leftX + r;
+            // 左右墙反弹（先做：反弹后的段才是 CCD 真正要扫的段）
+            if (endX < bounds.leftX + r) {
+                endX = bounds.leftX + r;
                 b.velocity.x = Math.abs(b.velocity.x);
-            } else if (nx > bounds.rightX - r) {
-                nx = bounds.rightX - r;
+            } else if (endX > bounds.rightX - r) {
+                endX = bounds.rightX - r;
                 b.velocity.x = -Math.abs(b.velocity.x);
             }
 
-            // 1) 触顶（飞过 grid 第 0 行 Y）→ 吸附到 row 0
-            // 2) 与任何已存在泡泡发生碰撞 → 吸附
-            let landed = false;
-            if (ny >= gridTopY) {
-                landed = true;
-            } else {
+            // ===== 连续碰撞检测 (CCD) =====
+            // 在 [start, end] 段上找最早的"落地"事件（t ∈ [0, 1]）
+            // 1) 与天花板 gridTopY 的交点
+            // 2) 与每颗网格泡泡的段-圆首次相交点（解二次方程取较小正根）
+            // 取 t 最小的作为落点 → 防止穿过球到上层空白
+            const dx = endX - startX;
+            const dy = endY - startY;
+            let bestT = Infinity;
+            let landX = 0;
+            let landY = 0;
+
+            // 1) 天花板
+            if (endY >= gridTopY) {
+                const tCeil = dy > 0 ? Math.max(0, (gridTopY - startY) / dy) : 0;
+                if (tCeil < bestT) {
+                    bestT = tCeil;
+                    landX = startX + dx * tCeil;
+                    landY = gridTopY;
+                }
+            }
+
+            // 2) 段-圆首次相交：|P(t) - C|² = R²
+            //    P(t) = start + t·d，展开为 a·t² + b·t + c = 0
+            const a = dx * dx + dy * dy;
+            if (a > 0) {
                 for (const gb of gridBubbles) {
                     const gp = gb.node.getWorldPosition();
-                    const dx = nx - gp.x;
-                    const dy = ny - gp.y;
-                    if (dx * dx + dy * dy < collideDist2) {
-                        landed = true;
-                        break;
+                    const fxv = startX - gp.x;
+                    const fyv = startY - gp.y;
+                    const bb = 2 * (fxv * dx + fyv * dy);
+                    const cc = fxv * fxv + fyv * fyv - collideR2;
+                    const disc = bb * bb - 4 * a * cc;
+                    if (disc < 0) continue;
+                    const sqrtD = Math.sqrt(disc);
+                    let tEnter = (-bb - sqrtD) / (2 * a);
+                    if (tEnter < 0) tEnter = 0;       // 起点已在圆内（极端情况）
+                    if (tEnter > 1) continue;          // 此段内未碰到
+                    if (tEnter < bestT) {
+                        bestT = tEnter;
+                        landX = startX + dx * tEnter;
+                        landY = startY + dy * tEnter;
                     }
                 }
             }
 
-            if (landed) {
-                // 用碰撞前一刻的位置上报（视觉上不会"穿透"）
-                this.deps.onBubbleLand(b, new Vec3(nx, ny, 0));
+            if (bestT !== Infinity) {
+                // 用真实碰撞点上报，而不是这一帧的终点。
+                // findNearestEmptyCell 用这个点找最近空格 → 不会跨过障碍球吸附到上层
+                this.deps.onBubbleLand(b, new Vec3(landX, landY, 0));
                 this.flying.splice(i, 1);
                 continue;
             }
 
             // 兜底：飞过屏幕顶（理论上 gridTopY 已先触发）
-            if (ny > bounds.topY) {
+            if (endY > bounds.topY) {
                 b.node.destroy();
                 this.flying.splice(i, 1);
                 continue;
             }
 
-            b.node.setPosition(nx, ny, 0);
+            b.node.setPosition(endX, endY, 0);
+
+            // 飞行轨迹：按距离间隔 spawn
+            if (fx && b.lastTrailPos) {
+                const curWorld = b.node.getWorldPosition();
+                const tdx = curWorld.x - b.lastTrailPos.x;
+                const tdy = curWorld.y - b.lastTrailPos.y;
+                if (tdx * tdx + tdy * tdy >= trailGap2) {
+                    fx.spawnTrailDot(curWorld, BubbleConfig.COLOR_PALETTE[b.color], r * 0.45);
+                    b.lastTrailPos = curWorld.clone();
+                }
+            }
         }
     }
 

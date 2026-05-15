@@ -103,6 +103,10 @@ export class BubbleGame extends MiniGameBase {
         world.addChild(fxNode);
         this.fx = fxNode.addComponent(BubbleFX);
 
+        // 把 fx 传给 shooter（飞行轨迹、枪口火）
+        // 注意：shooter 已经创建过；这里不能修改 deps，所以我们调一个 setter
+        shooter.attachFX(this.fx);
+
         // === 返回按钮（左上）===
         const back = createButton('返回', 140, 60, () => {
             director.loadScene(SceneName.MAIN);
@@ -148,22 +152,36 @@ export class BubbleGame extends MiniGameBase {
             });
         }
 
-        // 触发消除：动画弹出 + 颗粒爆发 + 闪光
-        for (let i = 0; i < eliminated.length; i++) {
-            const e = eliminated[i];
+        const centerPos = this.averagePos(eliminated.map(e => e.pos));
+        const score = this.scoreFor(cluster.length);
+
+        // ==== 反馈分三档：3-4 / 5-6 / 7+ ====
+        // 基础（所有消除都有）
+        for (const e of eliminated) {
             this.fx.burst(e.pos, e.color);
-            if (i === 0) this.fx.flash(e.pos, BubbleConfig.BUBBLE_RADIUS * 1.6);
         }
         for (const c of cluster) {
-            this.grid.removeBubble(c.row, c.col, true /* animated */);
+            this.grid.removeBubble(c.row, c.col, true);
+        }
+        this.fx.flash(centerPos, BubbleConfig.BUBBLE_RADIUS * 1.6);
+        this.fx.shockwave(centerPos, eliminated[0].color, BubbleConfig.BUBBLE_RADIUS * (3 + cluster.length * 0.4));
+
+        // 中型（≥5）：顿帧 + 镜头冲击 + 段位飘字
+        if (cluster.length >= 5) {
+            this.fx.hitStop(70);
+            if (this.worldNode) {
+                this.fx.worldPunch(this.worldNode, 0.04, 280);
+                this.fx.screenShake(this.worldNode, 14, 280);
+            }
+            this.fx.comboText(this.comboLabel(cluster.length), centerPos, this.comboColor(cluster.length));
+        } else {
+            // 普通飘字
+            this.fx.scorePopup(`+${score}`, centerPos);
         }
 
-        // 大消除：震屏 + 飘字
-        const score = this.scoreFor(cluster.length);
-        const centerPos = this.averagePos(eliminated.map(e => e.pos));
-        this.fx.scorePopup(`+${score}`, centerPos);
-        if (cluster.length >= 5 && this.worldNode) {
-            this.fx.screenShake(this.worldNode, 14, 280);
+        // 大型（≥7）：再加全屏一闪
+        if (cluster.length >= 7) {
+            this.fx.bgFlash(eliminated[0].color, 110, 280);
         }
 
         EventBus.emit('bubble.eliminated', { count: cluster.length, score });
@@ -181,8 +199,19 @@ export class BubbleGame extends MiniGameBase {
     }
 
     private scoreFor(clusterSize: number): number {
-        // 简单计分：3 颗 30 分，每多 1 颗加 15 分。Day 7 调
         return 30 + Math.max(0, clusterSize - 3) * 15;
+    }
+
+    private comboLabel(clusterSize: number): string {
+        if (clusterSize >= 9) return '天才!';
+        if (clusterSize >= 7) return '厉害!';
+        return '不错!';
+    }
+
+    private comboColor(clusterSize: number): Color {
+        if (clusterSize >= 9) return new Color(255, 80, 80);     // 红
+        if (clusterSize >= 7) return new Color(255, 160, 60);    // 橙
+        return new Color(255, 220, 80);                          // 黄
     }
 
     private averagePos(positions: Vec3[]): Vec3 {

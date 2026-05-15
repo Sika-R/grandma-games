@@ -15,6 +15,9 @@ export class Bubble extends Component {
     // 飞行速度（仅飞行中使用，吸附后清零）
     velocity: { x: number; y: number } | null = null;
 
+    // 飞行时上一次 spawn 尾迹点的世界位置（Shooter 用）
+    lastTrailPos: Vec3 | null = null;
+
     private graphics: Graphics | null = null;
 
     apply(color: BubbleColor) {

@@ -1,8 +1,9 @@
 import { _decorator, Component, Node, Vec3, UITransform, Layers, Color, view, director, Graphics, Camera, Canvas } from 'cc';
 import { MiniGameBase } from '../../core/MiniGameBase';
-import { BubbleConfig, computeGridCols, computeBubbleRadius } from './BubbleConfig';
+import { BubbleConfig, computeGridCols, computeBubbleRadius, computeShootSpeed } from './BubbleConfig';
 import { Grid } from './Grid';
 import { Shooter } from './Shooter';
+import { Bubble } from './Bubble';
 import { SceneName } from '../../data/Config';
 import { ensureCanvas, ensureUITransform, createButton, createLabelNode } from '../../ui/MainMenu';
 
@@ -14,6 +15,8 @@ const { ccclass } = _decorator;
 export class BubbleGame extends MiniGameBase {
     get gameId() { return 'bubble'; }
 
+    private grid: Grid | null = null;
+
     startGame() {
         // Day 6 起会有更多初始化（重置网格、计分归零等）。当前 onLoad 已搭建场景，此处暂留空。
     }
@@ -24,10 +27,11 @@ export class BubbleGame extends MiniGameBase {
         const visible = view.getVisibleSize();
         ensureUITransform(this.node).setContentSize(visible);
 
-        // ⚠️ 关键：先按屏幕实际像素重算泡泡半径，让泡泡在不同分辨率屏幕上保持物理大小恒定
-        //    （老人看得清；不至于在窄屏幕上变得很小）
+        // ⚠️ 关键：先按屏幕实际像素重算泡泡半径和飞行速度，让游戏在不同分辨率屏幕上感受一致
+        //    （老人看得清；不至于在窄屏幕上变得很小或飞得很慢）
         //    必须在创建任何泡泡/网格之前完成
         BubbleConfig.BUBBLE_RADIUS = computeBubbleRadius();
+        BubbleConfig.SHOOT_SPEED = computeShootSpeed();
 
         // === Camera + Canvas ===
         const canvasNode = ensureCanvas(this.node);
@@ -62,8 +66,9 @@ export class BubbleGame extends MiniGameBase {
         world.addChild(gridNode);
         const grid = gridNode.addComponent(Grid);
         grid.fillInitial(BubbleConfig.INITIAL_ROWS, cols);
+        this.grid = grid;
         const frame = view.getFrameSize();
-        console.log(`[BubbleGame] visible=${visible.width}x${visible.height}, frame=${frame.width}x${frame.height}, radius=${BubbleConfig.BUBBLE_RADIUS.toFixed(1)} (target 36 actual px), cols=${cols}, gridChildren=${gridNode.children.length}`);
+        console.log(`[BubbleGame] visible=${visible.width}x${visible.height}, frame=${frame.width}x${frame.height}, radius=${BubbleConfig.BUBBLE_RADIUS.toFixed(1)}, cols=${cols}, gridChildren=${gridNode.children.length}`);
 
         // === Shooter ===
         const shooterNode = new Node('Shooter');
@@ -80,6 +85,8 @@ export class BubbleGame extends MiniGameBase {
                 rightX: visible.width / 2,
                 topY: visible.height / 2,
             },
+            grid: grid,
+            onBubbleLand: (b, worldPos) => this.handleBubbleLand(b, worldPos),
         });
 
         // === 返回按钮（左上）===
@@ -95,5 +102,27 @@ export class BubbleGame extends MiniGameBase {
         canvasNode.addChild(title);
 
         this.startGame();
+    }
+
+    // 飞行泡泡触发吸附 → 找空格落位 → 同色 BFS 消除 → 悬空掉落
+    private handleBubbleLand(b: Bubble, worldPos: Vec3) {
+        if (!this.grid) return;
+        const cell = this.grid.findNearestEmptyCell(worldPos);
+        if (!cell) {
+            // 实在没地方放（极端情况），就直接销毁
+            b.node.destroy();
+            return;
+        }
+        this.grid.addBubble(b, cell.row, cell.col);
+
+        // 同色 3+ 消除
+        const cluster = this.grid.findColorCluster(cell.row, cell.col);
+        if (cluster.length >= 3) {
+            for (const c of cluster) this.grid.removeBubble(c.row, c.col);
+            // 消除后检查悬空
+            const floating = this.grid.findFloatingBubbles();
+            for (const f of floating) this.grid.removeBubble(f.row, f.col);
+            console.log(`[BubbleGame] eliminated ${cluster.length}, dropped ${floating.length} floating`);
+        }
     }
 }

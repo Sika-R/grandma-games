@@ -104,4 +104,143 @@ export class Grid extends Component {
     rowCount(): number {
         return this.cells.length;
     }
+
+    // ============ Day 6 新增：碰撞、吸附、消除、掉落 ============
+
+    // 世界坐标 → 网格本地坐标（grid 节点局部空间）
+    worldToLocal(worldPos: Vec3): Vec3 {
+        const gw = this.node.getWorldPosition();
+        return new Vec3(worldPos.x - gw.x, worldPos.y - gw.y, 0);
+    }
+
+    // 平铺所有泡泡（碰撞检测/广播用）
+    getAllBubbles(): Bubble[] {
+        const out: Bubble[] = [];
+        for (const row of this.cells) {
+            for (const b of row) {
+                if (b) out.push(b);
+            }
+        }
+        return out;
+    }
+
+    // 顶部 Y（世界坐标）—— 飞行泡泡 y 超过这个就该贴到 row 0
+    getTopWorldY(): number {
+        return this.node.getWorldPosition().y;
+    }
+
+    private cellEmpty(row: number, col: number): boolean {
+        if (row < 0) return false;
+        if (col < 0 || col >= this.colCount(row)) return false;
+        if (row >= this.cells.length) return true;       // 不存在的行视作空（允许扩展）
+        return this.cells[row][col] === null;
+    }
+
+    // 找到一个空格放置飞行泡泡：从计算出来的最近网格开始，向外环形搜索
+    findNearestEmptyCell(worldPos: Vec3): { row: number; col: number } | null {
+        const local = this.worldToLocal(worldPos);
+        const target = this.localToGrid(local);
+        // 计算位置可能在第 0 行之上，钳到 row >= 0
+        const startRow = Math.max(0, target.row);
+        const startCol = Math.max(0, Math.min(this.colCount(startRow) - 1, target.col));
+
+        if (this.cellEmpty(startRow, startCol)) return { row: startRow, col: startCol };
+
+        // 环形扩散搜最近空格
+        const maxRing = 4;
+        let best: { row: number; col: number; dist: number } | null = null;
+        for (let ring = 1; ring <= maxRing; ring++) {
+            for (let dr = -ring; dr <= ring; dr++) {
+                for (let dc = -ring; dc <= ring; dc++) {
+                    if (Math.max(Math.abs(dr), Math.abs(dc)) !== ring) continue;
+                    const r = startRow + dr;
+                    const c = startCol + dc;
+                    if (!this.cellEmpty(r, c)) continue;
+                    // 距离用网格坐标的 local 位置
+                    const cellLocal = this.gridToLocal(r, c);
+                    const d = (cellLocal.x - local.x) ** 2 + (cellLocal.y - local.y) ** 2;
+                    if (!best || d < best.dist) best = { row: r, col: c, dist: d };
+                }
+            }
+            if (best) return { row: best.row, col: best.col };
+        }
+        return null;
+    }
+
+    // 把一颗已经存在的泡泡放到网格里（自动扩展行）
+    addBubble(b: Bubble, row: number, col: number) {
+        while (this.cells.length <= row) {
+            const newRow: (Bubble | null)[] = new Array(this.colCount(this.cells.length)).fill(null);
+            this.cells.push(newRow);
+        }
+        if (col < 0 || col >= this.colCount(row)) return;
+        this.cells[row][col] = b;
+        b.row = row;
+        b.col = col;
+        b.velocity = null;
+        // 重新挂到 grid 下，并对齐到网格坐标
+        b.node.removeFromParent();
+        this.node.addChild(b.node);
+        b.node.setPosition(this.gridToLocal(row, col));
+    }
+
+    removeBubble(row: number, col: number) {
+        const b = this.getCell(row, col);
+        if (!b) return;
+        this.cells[row][col] = null;
+        b.node.destroy();
+    }
+
+    // BFS 找出与 (row,col) 同色相连的所有泡泡（含自己）
+    findColorCluster(row: number, col: number): { row: number; col: number }[] {
+        const start = this.getCell(row, col);
+        if (!start) return [];
+        const color = start.color;
+        const visited = new Set<string>();
+        const queue: { row: number; col: number }[] = [{ row, col }];
+        const result: { row: number; col: number }[] = [];
+
+        while (queue.length > 0) {
+            const cur = queue.shift()!;
+            const key = `${cur.row},${cur.col}`;
+            if (visited.has(key)) continue;
+            visited.add(key);
+            const b = this.getCell(cur.row, cur.col);
+            if (!b || b.color !== color) continue;
+            result.push(cur);
+            for (const n of this.getNeighbors(cur.row, cur.col)) queue.push(n);
+        }
+        return result;
+    }
+
+    // 找出"悬空"的泡泡：从 row 0 向下 BFS，没被访问到的就是悬空的
+    findFloatingBubbles(): { row: number; col: number }[] {
+        const visited = new Set<string>();
+        const queue: { row: number; col: number }[] = [];
+
+        if (this.cells.length > 0) {
+            for (let col = 0; col < this.colCount(0); col++) {
+                if (this.cells[0][col]) queue.push({ row: 0, col });
+            }
+        }
+
+        while (queue.length > 0) {
+            const cur = queue.shift()!;
+            const key = `${cur.row},${cur.col}`;
+            if (visited.has(key)) continue;
+            if (!this.getCell(cur.row, cur.col)) continue;
+            visited.add(key);
+            for (const n of this.getNeighbors(cur.row, cur.col)) queue.push(n);
+        }
+
+        const floating: { row: number; col: number }[] = [];
+        for (let row = 0; row < this.cells.length; row++) {
+            for (let col = 0; col < this.colCount(row); col++) {
+                if (this.cells[row][col] && !visited.has(`${row},${col}`)) {
+                    floating.push({ row, col });
+                }
+            }
+        }
+        return floating;
+    }
 }

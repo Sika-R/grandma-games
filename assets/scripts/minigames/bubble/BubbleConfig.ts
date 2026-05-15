@@ -22,7 +22,7 @@ export const BubbleConfig = {
 
     // 发射器
     SHOOTER_BOTTOM_MARGIN: 100,         // 距底部多少像素
-    SHOOT_SPEED: 1200,                  // 像素/秒
+    SHOOT_SPEED: 1200,                  // design 像素/秒，运行时根据屏幕重算
     AIM_MAX_REFLECTIONS: 4,             // 瞄准线最多反弹次数
     AIM_DASH_LEN: 14,                   // 虚线段长
     AIM_GAP_LEN: 8,                     // 虚线间隔
@@ -41,6 +41,18 @@ export function rowHeight(): number {
 export function computeBubbleRadius(): number {
     const visible = view.getVisibleSize();
     return visible.width / (2 * BubbleConfig.PREFERRED_COLS);
+}
+
+// 目标飞行速度：实际屏幕像素/秒（保证各设备感受一致）
+// 1500 表示 ~0.3 秒飞过 iPhone 屏宽，比较爽快
+const TARGET_ACTUAL_SHOOT_SPEED = 1500;
+
+// 反推 design 速度
+export function computeShootSpeed(): number {
+    const visible = view.getVisibleSize();
+    const frame = view.getFrameSize();
+    if (frame.width === 0) return TARGET_ACTUAL_SHOOT_SPEED;
+    return TARGET_ACTUAL_SHOOT_SPEED * (visible.width / frame.width);
 }
 
 // 列数：直接返回偏好值（保持各设备一致的游戏感受）

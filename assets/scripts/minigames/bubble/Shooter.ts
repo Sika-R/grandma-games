@@ -2,19 +2,21 @@ import { _decorator, Component, Node, Vec3, Vec2, UITransform, Layers, Graphics,
 import { BubbleConfig } from './BubbleConfig';
 import { Bubble } from './Bubble';
 import { BubbleColor, randomBubbleColor } from './BubbleType';
+import { Grid } from './Grid';
 
 const { ccclass } = _decorator;
 
 interface ShooterBounds {
     leftX: number;          // 反弹墙：左
     rightX: number;         // 反弹墙：右
-    topY: number;           // 飞行上限（超过即销毁，Day 6 改为吸附）
+    topY: number;           // 飞行上限（兜底，正常应该被 grid 顶或泡泡先拦截）
 }
 
 interface ShooterDeps {
     worldRoot: Node;        // 飞行泡泡的父节点
     bounds: ShooterBounds;
-    onBubbleEscape?: (b: Bubble) => void;  // 飞出顶部时回调（Day 6 接吸附）
+    grid: Grid;             // 用于碰撞检测和顶部边界
+    onBubbleLand: (b: Bubble, worldPos: Vec3) => void;  // 飞行泡泡需要吸附时回调
 }
 
 // 发射器 Component。挂在 Shooter 节点上（节点位置 = 发射点）
@@ -163,7 +165,13 @@ export class Shooter extends Component {
     update(dt: number) {
         if (!this.deps) return;
         const bounds = this.deps.bounds;
+        const grid = this.deps.grid;
         const r = BubbleConfig.BUBBLE_RADIUS;
+        // 碰撞距离：略小于 2r，让吸附在轻微重叠时触发，视觉更自然
+        const collideDist2 = (2 * r * 0.92) ** 2;
+        const gridTopY = grid.getTopWorldY();
+        // 缓存所有网格泡泡的世界坐标，避免循环里频繁读
+        const gridBubbles = grid.getAllBubbles();
 
         for (let i = this.flying.length - 1; i >= 0; i--) {
             const b = this.flying[i];
@@ -175,7 +183,7 @@ export class Shooter extends Component {
             let nx = pos.x + b.velocity.x * dt;
             let ny = pos.y + b.velocity.y * dt;
 
-            // 反弹
+            // 左右墙反弹
             if (nx < bounds.leftX + r) {
                 nx = bounds.leftX + r;
                 b.velocity.x = Math.abs(b.velocity.x);
@@ -184,9 +192,32 @@ export class Shooter extends Component {
                 b.velocity.x = -Math.abs(b.velocity.x);
             }
 
-            // 飞过顶部 —— Day 6 改成吸附
+            // 1) 触顶（飞过 grid 第 0 行 Y）→ 吸附到 row 0
+            // 2) 与任何已存在泡泡发生碰撞 → 吸附
+            let landed = false;
+            if (ny >= gridTopY) {
+                landed = true;
+            } else {
+                for (const gb of gridBubbles) {
+                    const gp = gb.node.getWorldPosition();
+                    const dx = nx - gp.x;
+                    const dy = ny - gp.y;
+                    if (dx * dx + dy * dy < collideDist2) {
+                        landed = true;
+                        break;
+                    }
+                }
+            }
+
+            if (landed) {
+                // 用碰撞前一刻的位置上报（视觉上不会"穿透"）
+                this.deps.onBubbleLand(b, new Vec3(nx, ny, 0));
+                this.flying.splice(i, 1);
+                continue;
+            }
+
+            // 兜底：飞过屏幕顶（理论上 gridTopY 已先触发）
             if (ny > bounds.topY) {
-                if (this.deps.onBubbleEscape) this.deps.onBubbleEscape(b);
                 b.node.destroy();
                 this.flying.splice(i, 1);
                 continue;

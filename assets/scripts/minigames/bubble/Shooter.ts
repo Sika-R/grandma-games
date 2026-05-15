@@ -1,0 +1,271 @@
+import { _decorator, Component, Node, Vec3, Vec2, UITransform, Layers, Graphics, Color, EventTouch, EventMouse, input, Input, Camera, view } from 'cc';
+import { BubbleConfig } from './BubbleConfig';
+import { Bubble } from './Bubble';
+import { BubbleColor, randomBubbleColor } from './BubbleType';
+
+const { ccclass } = _decorator;
+
+interface ShooterBounds {
+    leftX: number;          // 反弹墙：左
+    rightX: number;         // 反弹墙：右
+    topY: number;           // 飞行上限（超过即销毁，Day 6 改为吸附）
+}
+
+interface ShooterDeps {
+    worldRoot: Node;        // 飞行泡泡的父节点
+    bounds: ShooterBounds;
+    onBubbleEscape?: (b: Bubble) => void;  // 飞出顶部时回调（Day 6 接吸附）
+}
+
+// 发射器 Component。挂在 Shooter 节点上（节点位置 = 发射点）
+// 由 BubbleGame.onLoad 调 init() 注入依赖
+@ccclass('Shooter')
+export class Shooter extends Component {
+    private deps: ShooterDeps | null = null;
+
+    private aimGraphics: Graphics | null = null;
+    private bodyGraphics: Graphics | null = null;
+    private currentBubble: Bubble | null = null;       // 待发射
+    private nextColor: BubbleColor = randomBubbleColor();
+
+    private aimDirection: Vec2 = new Vec2(0, 1);
+    private flying: Bubble[] = [];
+
+    // "按下→抬起" 守卫：防止没有先按下就触发 fire（避免 Cocos 浏览器预览里
+    // 鼠标移动/移出 canvas 等场景误触 TOUCH_END/TOUCH_CANCEL）
+    private pressed: boolean = false;
+
+    init(deps: ShooterDeps) {
+        this.deps = deps;
+        this.spawnNextBubble();
+        const wp = this.node.getWorldPosition();
+        console.log(`[Shooter] init: worldPos=(${wp.x.toFixed(1)}, ${wp.y.toFixed(1)}), bounds=${JSON.stringify(deps.bounds)}`);
+    }
+
+    onLoad() {
+        // 自身画一个发射器底座
+        const bodyNode = new Node('Body');
+        bodyNode.layer = Layers.Enum.UI_2D;
+        bodyNode.addComponent(UITransform);
+        this.node.addChild(bodyNode);
+        this.bodyGraphics = bodyNode.addComponent(Graphics);
+        const r = BubbleConfig.BUBBLE_RADIUS;
+        this.bodyGraphics.fillColor = new Color(200, 200, 220);
+        this.bodyGraphics.circle(0, 0, r * 0.9);
+        this.bodyGraphics.fill();
+
+        // 瞄准线 Graphics —— 加在 worldRoot 那层（init 后才知道），先放在 shooter 节点上
+        const aimNode = new Node('Aim');
+        aimNode.layer = Layers.Enum.UI_2D;
+        aimNode.addComponent(UITransform);
+        this.node.parent?.addChild(aimNode);
+        this.aimGraphics = aimNode.addComponent(Graphics);
+
+        // 监听全局触摸/鼠标
+        // - TOUCH_START: 标记 pressed=true，开始瞄准
+        // - TOUCH_MOVE: 拖拽中持续更新瞄准
+        // - TOUCH_END: 只有 pressed 才发射（避免误触）
+        // - TOUCH_CANCEL: 取消按下状态，不发射
+        // - MOUSE_MOVE: 桌面浏览器悬停瞄准（不点击也能更新瞄准线）
+        input.on(Input.EventType.TOUCH_START, this.onPressStart, this);
+        input.on(Input.EventType.TOUCH_MOVE, this.updateAim, this);
+        input.on(Input.EventType.TOUCH_END, this.onPressEnd, this);
+        input.on(Input.EventType.TOUCH_CANCEL, this.onPressCancel, this);
+        input.on(Input.EventType.MOUSE_MOVE, this.updateAim, this);
+    }
+
+    onDestroy() {
+        input.off(Input.EventType.TOUCH_START, this.onPressStart, this);
+        input.off(Input.EventType.TOUCH_MOVE, this.updateAim, this);
+        input.off(Input.EventType.TOUCH_END, this.onPressEnd, this);
+        input.off(Input.EventType.TOUCH_CANCEL, this.onPressCancel, this);
+        input.off(Input.EventType.MOUSE_MOVE, this.updateAim, this);
+    }
+
+    private onPressStart(e: EventTouch) {
+        this.pressed = true;
+        this.updateAim(e);
+    }
+
+    private onPressEnd(e: EventTouch) {
+        if (!this.pressed) return;          // 没按下过，忽略（防误触发）
+        this.pressed = false;
+        this.fire(e);
+    }
+
+    private onPressCancel(_e: EventTouch) {
+        this.pressed = false;               // 取消，不发射
+    }
+
+    private spawnNextBubble() {
+        if (!this.deps) return;
+        const color = this.nextColor;
+        this.nextColor = randomBubbleColor();
+        // 待发射泡泡作为 shooter 子节点显示
+        const b = Bubble.create(this.node, color, new Vec3(0, 0, 0));
+        this.currentBubble = b;
+    }
+
+    private updateAim(e: EventTouch | EventMouse) {
+        // ⚠️ 关键：getUILocation() 返回 UI 屏幕坐标（原点在屏幕左下角）
+        //    但 node.getWorldPosition() 是世界坐标（原点在画布中心）
+        //    必须减去 visibleSize/2 把 UI 坐标转成世界坐标，否则瞄准方向永远偏一个角度
+        const touch = e.getUILocation();
+        const visible = view.getVisibleSize();
+        const touchWorldX = touch.x - visible.width / 2;
+        const touchWorldY = touch.y - visible.height / 2;
+
+        const shooterPos = this.node.getWorldPosition();
+        const dx = touchWorldX - shooterPos.x;
+        const dy = touchWorldY - shooterPos.y;
+
+        // 不允许向下/水平射击：触摸点必须在发射器上方
+        if (dy <= 1) return;
+
+        const len = Math.hypot(dx, dy);
+        if (len < 1) return;
+        this.aimDirection.set(dx / len, dy / len);
+        this.recomputeAimLine();
+    }
+
+    private fire(e: EventTouch) {
+        if (!this.currentBubble || !this.deps) return;
+
+        // 同样要做 UI → 世界 坐标转换
+        const touch = e.getUILocation();
+        const visible = view.getVisibleSize();
+        const touchWorldY = touch.y - visible.height / 2;
+
+        const shooterPos = this.node.getWorldPosition();
+        if (touchWorldY - shooterPos.y <= 1) return;  // 点击在发射器下方，忽略
+        this.updateAim(e);
+
+        const b = this.currentBubble;
+        this.currentBubble = null;
+
+        // 把泡泡从 shooter 子节点 reparent 到 worldRoot，世界位置保持
+        const worldPos = b.node.getWorldPosition();
+        b.node.removeFromParent();
+        this.deps.worldRoot.addChild(b.node);
+        b.node.setWorldPosition(worldPos);
+
+        const speed = BubbleConfig.SHOOT_SPEED;
+        b.velocity = { x: this.aimDirection.x * speed, y: this.aimDirection.y * speed };
+        this.flying.push(b);
+
+        // 清掉瞄准线
+        this.aimGraphics?.clear();
+
+        // 上膛下一颗
+        this.spawnNextBubble();
+    }
+
+    update(dt: number) {
+        if (!this.deps) return;
+        const bounds = this.deps.bounds;
+        const r = BubbleConfig.BUBBLE_RADIUS;
+
+        for (let i = this.flying.length - 1; i >= 0; i--) {
+            const b = this.flying[i];
+            if (!b.velocity) {
+                this.flying.splice(i, 1);
+                continue;
+            }
+            const pos = b.node.position;
+            let nx = pos.x + b.velocity.x * dt;
+            let ny = pos.y + b.velocity.y * dt;
+
+            // 反弹
+            if (nx < bounds.leftX + r) {
+                nx = bounds.leftX + r;
+                b.velocity.x = Math.abs(b.velocity.x);
+            } else if (nx > bounds.rightX - r) {
+                nx = bounds.rightX - r;
+                b.velocity.x = -Math.abs(b.velocity.x);
+            }
+
+            // 飞过顶部 —— Day 6 改成吸附
+            if (ny > bounds.topY) {
+                if (this.deps.onBubbleEscape) this.deps.onBubbleEscape(b);
+                b.node.destroy();
+                this.flying.splice(i, 1);
+                continue;
+            }
+
+            b.node.setPosition(nx, ny, 0);
+        }
+    }
+
+    private recomputeAimLine() {
+        if (!this.aimGraphics || !this.deps) return;
+        const g = this.aimGraphics;
+        g.clear();
+        g.lineWidth = 3;
+        g.strokeColor = new Color(255, 255, 255, 180);
+
+        const bounds = this.deps.bounds;
+        const r = BubbleConfig.BUBBLE_RADIUS;
+        const start = this.node.getWorldPosition();   // UI 空间
+        let x = start.x;
+        let y = start.y;
+        let dx = this.aimDirection.x;
+        let dy = this.aimDirection.y;
+
+        const points: Vec2[] = [new Vec2(x, y)];
+        for (let bounce = 0; bounce <= BubbleConfig.AIM_MAX_REFLECTIONS; bounce++) {
+            // 求与左/右墙、顶部的最近交点
+            const leftLimit = bounds.leftX + r;
+            const rightLimit = bounds.rightX - r;
+            const topLimit = bounds.topY;
+
+            let tWall = Infinity;
+            let hitWall: 'left' | 'right' | 'top' | null = null;
+
+            if (dx < 0) {
+                const t = (leftLimit - x) / dx;
+                if (t > 0 && t < tWall) { tWall = t; hitWall = 'left'; }
+            } else if (dx > 0) {
+                const t = (rightLimit - x) / dx;
+                if (t > 0 && t < tWall) { tWall = t; hitWall = 'right'; }
+            }
+            if (dy > 0) {
+                const t = (topLimit - y) / dy;
+                if (t > 0 && t < tWall) { tWall = t; hitWall = 'top'; }
+            }
+
+            if (!hitWall || !isFinite(tWall)) break;
+
+            x += dx * tWall;
+            y += dy * tWall;
+            points.push(new Vec2(x, y));
+
+            if (hitWall === 'top') break;
+            // 反弹
+            dx = -dx;
+        }
+
+        // 画虚线
+        const dash = BubbleConfig.AIM_DASH_LEN;
+        const gap = BubbleConfig.AIM_GAP_LEN;
+        for (let i = 0; i < points.length - 1; i++) {
+            this.drawDashedLine(g, points[i], points[i + 1], dash, gap);
+        }
+        g.stroke();
+    }
+
+    private drawDashedLine(g: Graphics, a: Vec2, b: Vec2, dash: number, gap: number) {
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const len = Math.hypot(dx, dy);
+        if (len < 1) return;
+        const ux = dx / len;
+        const uy = dy / len;
+        let drawn = 0;
+        while (drawn < len) {
+            const segEnd = Math.min(drawn + dash, len);
+            g.moveTo(a.x + ux * drawn, a.y + uy * drawn);
+            g.lineTo(a.x + ux * segEnd, a.y + uy * segEnd);
+            drawn = segEnd + gap;
+        }
+    }
+}

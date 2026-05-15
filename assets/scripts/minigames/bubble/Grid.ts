@@ -182,13 +182,29 @@ export class Grid extends Component {
         b.node.removeFromParent();
         this.node.addChild(b.node);
         b.node.setPosition(this.gridToLocal(row, col));
+        // 落位的小弹跳，爽感
+        b.landSquash();
     }
 
-    removeBubble(row: number, col: number) {
+    // 移除（销毁）一颗泡泡。animated=true 时播放弹出动画再销毁
+    // 注意：cells 数据立刻清空，所以飞行碰撞检测不会再撞到正在动画的泡泡
+    removeBubble(row: number, col: number, animated: boolean = false) {
         const b = this.getCell(row, col);
         if (!b) return;
         this.cells[row][col] = null;
-        b.node.destroy();
+        if (animated) {
+            b.popOut().then(() => b.node.destroy());
+        } else {
+            b.node.destroy();
+        }
+    }
+
+    // 悬空泡泡：重力掉落动画，然后销毁
+    dropBubble(row: number, col: number) {
+        const b = this.getCell(row, col);
+        if (!b) return;
+        this.cells[row][col] = null;
+        b.dropOut().then(() => b.node.destroy());
     }
 
     // BFS 找出与 (row,col) 同色相连的所有泡泡（含自己）

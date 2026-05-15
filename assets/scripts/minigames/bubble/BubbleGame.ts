@@ -4,7 +4,10 @@ import { BubbleConfig, computeGridCols, computeBubbleRadius, computeShootSpeed }
 import { Grid } from './Grid';
 import { Shooter } from './Shooter';
 import { Bubble } from './Bubble';
+import { BubbleFX } from './BubbleFX';
 import { SceneName } from '../../data/Config';
+import { EventBus } from '../../core/EventBus';
+import { AudioManager } from '../../core/AudioManager';
 import { ensureCanvas, ensureUITransform, createButton, createLabelNode } from '../../ui/MainMenu';
 
 const { ccclass } = _decorator;
@@ -16,6 +19,8 @@ export class BubbleGame extends MiniGameBase {
     get gameId() { return 'bubble'; }
 
     private grid: Grid | null = null;
+    private fx: BubbleFX | null = null;
+    private worldNode: Node | null = null;
 
     startGame() {
         // Day 6 起会有更多初始化（重置网格、计分归零等）。当前 onLoad 已搭建场景，此处暂留空。
@@ -51,6 +56,7 @@ export class BubbleGame extends MiniGameBase {
         world.layer = Layers.Enum.UI_2D;
         ensureUITransform(world).setContentSize(visible);
         canvasNode.addChild(world);
+        this.worldNode = world;
 
         // === Grid ===
         const gridNode = new Node('Grid');
@@ -89,6 +95,14 @@ export class BubbleGame extends MiniGameBase {
             onBubbleLand: (b, worldPos) => this.handleBubbleLand(b, worldPos),
         });
 
+        // === FX Layer（颗粒、飘字、闪光等都加到这层；放在 world 内最上层，
+        //     这样震屏时 FX 跟随 world 一起动，UI 按钮不动）===
+        const fxNode = new Node('FX');
+        fxNode.layer = Layers.Enum.UI_2D;
+        ensureUITransform(fxNode);
+        world.addChild(fxNode);
+        this.fx = fxNode.addComponent(BubbleFX);
+
         // === 返回按钮（左上）===
         const back = createButton('返回', 140, 60, () => {
             director.loadScene(SceneName.MAIN);
@@ -105,24 +119,78 @@ export class BubbleGame extends MiniGameBase {
     }
 
     // 飞行泡泡触发吸附 → 找空格落位 → 同色 BFS 消除 → 悬空掉落
+    // 全部反馈通过 fx 模块和 EventBus 广播
     private handleBubbleLand(b: Bubble, worldPos: Vec3) {
-        if (!this.grid) return;
+        if (!this.grid || !this.fx) return;
         const cell = this.grid.findNearestEmptyCell(worldPos);
         if (!cell) {
-            // 实在没地方放（极端情况），就直接销毁
             b.node.destroy();
             return;
         }
+
+        // 落位（addBubble 内部会触发 landSquash 弹一下）
         this.grid.addBubble(b, cell.row, cell.col);
+        EventBus.emit('bubble.landed', { row: cell.row, col: cell.col, color: b.color });
+        AudioManager.playSfx('land');
 
         // 同色 3+ 消除
         const cluster = this.grid.findColorCluster(cell.row, cell.col);
-        if (cluster.length >= 3) {
-            for (const c of cluster) this.grid.removeBubble(c.row, c.col);
-            // 消除后检查悬空
-            const floating = this.grid.findFloatingBubbles();
-            for (const f of floating) this.grid.removeBubble(f.row, f.col);
-            console.log(`[BubbleGame] eliminated ${cluster.length}, dropped ${floating.length} floating`);
+        if (cluster.length < 3) return;
+
+        // 关键：先在数据还在的时候采集每颗泡泡的世界位置 + 颜色，给 FX 用
+        const eliminated: { pos: Vec3; color: Color }[] = [];
+        for (const c of cluster) {
+            const eb = this.grid.getCell(c.row, c.col);
+            if (!eb) continue;
+            eliminated.push({
+                pos: eb.node.getWorldPosition().clone(),
+                color: BubbleConfig.COLOR_PALETTE[eb.color],
+            });
         }
+
+        // 触发消除：动画弹出 + 颗粒爆发 + 闪光
+        for (let i = 0; i < eliminated.length; i++) {
+            const e = eliminated[i];
+            this.fx.burst(e.pos, e.color);
+            if (i === 0) this.fx.flash(e.pos, BubbleConfig.BUBBLE_RADIUS * 1.6);
+        }
+        for (const c of cluster) {
+            this.grid.removeBubble(c.row, c.col, true /* animated */);
+        }
+
+        // 大消除：震屏 + 飘字
+        const score = this.scoreFor(cluster.length);
+        const centerPos = this.averagePos(eliminated.map(e => e.pos));
+        this.fx.scorePopup(`+${score}`, centerPos);
+        if (cluster.length >= 5 && this.worldNode) {
+            this.fx.screenShake(this.worldNode, 14, 280);
+        }
+
+        EventBus.emit('bubble.eliminated', { count: cluster.length, score });
+        AudioManager.playSfx(cluster.length >= 5 ? 'big_pop' : 'pop');
+
+        // 悬空掉落
+        const floating = this.grid.findFloatingBubbles();
+        for (const f of floating) {
+            this.grid.dropBubble(f.row, f.col);
+        }
+        if (floating.length > 0) {
+            EventBus.emit('bubble.dropped', { count: floating.length });
+            AudioManager.playSfx('drop');
+        }
+    }
+
+    private scoreFor(clusterSize: number): number {
+        // 简单计分：3 颗 30 分，每多 1 颗加 15 分。Day 7 调
+        return 30 + Math.max(0, clusterSize - 3) * 15;
+    }
+
+    private averagePos(positions: Vec3[]): Vec3 {
+        if (positions.length === 0) return new Vec3(0, 0, 0);
+        const sum = positions.reduce(
+            (acc, p) => new Vec3(acc.x + p.x, acc.y + p.y, 0),
+            new Vec3(0, 0, 0)
+        );
+        return new Vec3(sum.x / positions.length, sum.y / positions.length, 0);
     }
 }

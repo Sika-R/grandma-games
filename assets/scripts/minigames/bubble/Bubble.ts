@@ -1,4 +1,4 @@
-import { _decorator, Component, Node, Graphics, Color, UITransform, Layers, Vec3 } from 'cc';
+import { _decorator, Component, Node, Graphics, Color, UITransform, Layers, Vec3, tween, UIOpacity } from 'cc';
 import { BubbleConfig } from './BubbleConfig';
 import { BubbleColor } from './BubbleType';
 
@@ -34,6 +34,52 @@ export class Bubble extends Component {
         this.graphics.fillColor = new Color(255, 255, 255, 80);
         this.graphics.circle(-r * 0.35, r * 0.35, r * 0.25);
         this.graphics.fill();
+    }
+
+    // ============ 动画（特效底子）============
+
+    // 落位时的轻微弹一下（爽感）
+    landSquash(durationMs = 180) {
+        const t = durationMs / 1000;
+        this.node.setScale(0.7, 0.7, 1);
+        tween(this.node)
+            .to(t * 0.4, { scale: new Vec3(1.1, 1.1, 1) }, { easing: 'cubicOut' })
+            .to(t * 0.6, { scale: Vec3.ONE }, { easing: 'cubicInOut' })
+            .start();
+    }
+
+    // 消除时的弹出 + 缩没（颗粒爆发由 FX 模块负责）
+    popOut(durationMs = 220): Promise<void> {
+        return new Promise<void>(resolve => {
+            const t = durationMs / 1000;
+            const op = this.node.getComponent(UIOpacity) ?? this.node.addComponent(UIOpacity);
+            tween(this.node)
+                .to(t * 0.25, { scale: new Vec3(1.35, 1.35, 1) }, { easing: 'cubicOut' })
+                .to(t * 0.75, { scale: Vec3.ZERO }, { easing: 'cubicIn' })
+                .call(() => resolve())
+                .start();
+            tween(op)
+                .delay(t * 0.25)
+                .to(t * 0.75, { opacity: 0 })
+                .start();
+        });
+    }
+
+    // 悬空掉落：重力加速向下，淡出
+    dropOut(durationMs = 700, fallDistance = 1200): Promise<void> {
+        return new Promise<void>(resolve => {
+            const t = durationMs / 1000;
+            const op = this.node.getComponent(UIOpacity) ?? this.node.addComponent(UIOpacity);
+            const startPos = this.node.position.clone();
+            tween(this.node)
+                .to(t, { position: new Vec3(startPos.x, startPos.y - fallDistance, 0) }, { easing: 'quadIn' })
+                .call(() => resolve())
+                .start();
+            tween(op)
+                .delay(t * 0.5)
+                .to(t * 0.5, { opacity: 0 })
+                .start();
+        });
     }
 
     onLoad() {

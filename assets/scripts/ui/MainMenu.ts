@@ -1,4 +1,4 @@
-import { _decorator, Component, Node, Label, Color, UITransform, Canvas, Camera, view, director, Layers, Vec3, EventTouch, Sprite, SpriteFrame, ImageAsset, Texture2D, Graphics } from 'cc';
+import { _decorator, Component, Node, Label, Color, UITransform, Canvas, Camera, view, director, Layers, Vec3, EventTouch, Sprite, SpriteFrame, ImageAsset, Texture2D, Graphics, tween } from 'cc';
 import { SaveManager } from '../core/SaveManager';
 import { EventBus, Events } from '../core/EventBus';
 import { SceneName } from '../data/Config';
@@ -56,7 +56,14 @@ export class MainMenu extends Component {
 
         // === 开始泡泡龙按钮（自绘） ===
         const btn = createButton('开始泡泡龙', 320, 100, () => {
-            director.loadScene(SceneName.BUBBLE);
+            console.log('[MainMenu] 开始按钮 clicked, loading scene:', SceneName.BUBBLE);
+            director.loadScene(SceneName.BUBBLE, (err) => {
+                if (err) {
+                    console.error('[MainMenu] loadScene FAILED:', err);
+                } else {
+                    console.log('[MainMenu] loadScene OK ->', SceneName.BUBBLE);
+                }
+            });
         });
         btn.setPosition(new Vec3(0, -visible.height * 0.1, 0));
         canvasNode.addChild(btn);
@@ -130,7 +137,7 @@ export function createLabelNode(text: string, fontSize: number, color: Color): N
     return n;
 }
 
-// 自绘按钮：背景圆角矩形 + Label + 触摸事件
+// 自绘按钮：背景圆角矩形 + Label + 触摸事件 + 按下视觉反馈
 export function createButton(
     text: string,
     width: number,
@@ -157,9 +164,16 @@ export function createButton(
     const lblNode = createLabelNode(text, Math.floor(height * 0.4), new Color(255, 255, 255));
     root.addChild(lblNode);
 
-    // 触摸事件
+    // 按下反馈：缩到 0.92，抬起回弹
+    root.on(Node.EventType.TOUCH_START, () => {
+        tween(root).to(0.06, { scale: new Vec3(0.92, 0.92, 1) }).start();
+    });
     root.on(Node.EventType.TOUCH_END, (_e: EventTouch) => {
+        tween(root).to(0.12, { scale: Vec3.ONE }, { easing: 'backOut' }).start();
         onClick();
+    });
+    root.on(Node.EventType.TOUCH_CANCEL, () => {
+        tween(root).to(0.12, { scale: Vec3.ONE }).start();
     });
 
     return root;

@@ -9,7 +9,8 @@ export const Config = {
 export type GameId = 'bubble';
 
 // 启动场景名（如果切换主场景在这里改）
+// 注意：场景名必须跟 Cocos 编辑器里 .scene 文件名完全一致（大小写敏感）
 export const SceneName = {
     MAIN: 'MainScene',
-    BUBBLE: 'BubbleShooter',
+    BUBBLE: 'BubbleDuragon',
 } as const;

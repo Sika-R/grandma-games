@@ -141,8 +141,14 @@ export class BubbleGame extends MiniGameBase {
         this.buildHUD(canvasNode, visible);
 
         // === 返回按钮（左上）===
+        // 游戏中点 → 弹暂停面板（继续 / 结束）
+        // 游戏已结束 → 直接回主菜单
         const back = createButton('返回', 140, 60, () => {
-            director.loadScene(SceneName.MAIN);
+            if (this.gameOver) {
+                director.loadScene(SceneName.MAIN);
+            } else {
+                this.showPausePanel();
+            }
         }, new Color(80, 80, 100));
         back.setPosition(-visible.width / 2 + 90, visible.height / 2 - 60, 0);
         canvasNode.addChild(back);
@@ -340,7 +346,7 @@ export class BubbleGame extends MiniGameBase {
         return lowestY < this.dangerLineY;
     }
 
-    private endGameWithResult(success: boolean) {
+    private endGameWithResult(success: boolean, isQuit: boolean = false) {
         if (this.gameOver) return;
         this.gameOver = true;
         if (this.shooter) this.shooter.setLocked(true);
@@ -349,10 +355,83 @@ export class BubbleGame extends MiniGameBase {
         const duration = Date.now() - this.startedAt;
         this.endGame({ success, score: this.score, duration });
 
-        this.showEndPanel(success);
+        this.showEndPanel(success, isQuit);
     }
 
-    private showEndPanel(success: boolean) {
+    // 暂停面板：冻结发射器 + 飞行，给玩家"继续 / 结束"两个选项
+    // 不调用 endGame —— 暂停期间游戏状态完整保留，选"继续"可无缝恢复
+    private showPausePanel() {
+        if (!this.canvasNode || this.gameOver) return;
+        if (this.shooter) this.shooter.setLocked(true);
+
+        const visible = view.getVisibleSize();
+
+        const overlay = new Node('PauseOverlay');
+        overlay.layer = Layers.Enum.UI_2D;
+        ensureUITransform(overlay).setContentSize(visible);
+        const og = overlay.addComponent(Graphics);
+        og.fillColor = new Color(0, 0, 0, 180);
+        og.rect(-visible.width / 2, -visible.height / 2, visible.width, visible.height);
+        og.fill();
+        const ovOp = overlay.addComponent(UIOpacity);
+        ovOp.opacity = 0;
+        overlay.on(Node.EventType.TOUCH_END, () => { /* 吞掉穿透点击 */ });
+        this.canvasNode.addChild(overlay);
+        tween(ovOp).to(0.2, { opacity: 220 }).start();
+
+        const panel = new Node('PausePanel');
+        panel.layer = Layers.Enum.UI_2D;
+        const panelW = Math.min(visible.width * 0.8, 720);
+        const panelH = panelW * 0.6;
+        ensureUITransform(panel).setContentSize(panelW, panelH);
+        const pg = panel.addComponent(Graphics);
+        pg.fillColor = new Color(40, 50, 80, 240);
+        pg.roundRect(-panelW / 2, -panelH / 2, panelW, panelH, 28);
+        pg.fill();
+        pg.lineWidth = 4;
+        pg.strokeColor = new Color(180, 180, 200);
+        pg.roundRect(-panelW / 2, -panelH / 2, panelW, panelH, 28);
+        pg.stroke();
+        overlay.addChild(panel);
+
+        // 标题：暂停
+        const titleNode = createLabelNode('暂停', 80, new Color(220, 220, 240));
+        titleNode.setPosition(0, panelH * 0.25, 0);
+        panel.addChild(titleNode);
+
+        // 当前分数（小字提示）
+        const scoreNode = createLabelNode(`当前得分: ${this.score}`, 36, new Color(255, 230, 100));
+        scoreNode.setPosition(0, panelH * 0.0, 0);
+        panel.addChild(scoreNode);
+
+        // 按钮：继续 / 结束
+        const btnW = panelW * 0.4;
+        const btnH = 90;
+        const btnY = -panelH * 0.3;
+
+        const continueBtn = createButton('继续', btnW, btnH, () => {
+            this.fadeOutEndPanel(overlay, () => {
+                if (this.shooter && !this.gameOver) this.shooter.setLocked(false);
+            });
+        }, new Color(80, 140, 220));
+        continueBtn.setPosition(-panelW * 0.22, btnY, 0);
+        panel.addChild(continueBtn);
+
+        const endBtn = createButton('结束', btnW, btnH, () => {
+            // 关掉暂停面板再走结算流程（结算面板会接着弹出来）
+            this.fadeOutEndPanel(overlay, () => {
+                this.endGameWithResult(false, true /* isQuit */);
+            });
+        }, new Color(180, 100, 100));
+        endBtn.setPosition(panelW * 0.22, btnY, 0);
+        panel.addChild(endBtn);
+
+        // 入场动画
+        panel.setScale(0.5, 0.5, 1);
+        tween(panel).to(0.3, { scale: new Vec3(1, 1, 1) }, { easing: 'backOut' }).start();
+    }
+
+    private showEndPanel(success: boolean, isQuit: boolean = false) {
         if (!this.canvasNode) return;
         const visible = view.getVisibleSize();
 
@@ -382,14 +461,19 @@ export class BubbleGame extends MiniGameBase {
         pg.roundRect(-panelW / 2, -panelH / 2, panelW, panelH, 28);
         pg.fill();
         pg.lineWidth = 4;
-        pg.strokeColor = success ? new Color(120, 220, 120) : new Color(220, 120, 120);
+        // 边框颜色：胜利绿 / 失败红 / 中途退出灰白
+        pg.strokeColor = isQuit
+            ? new Color(180, 180, 200)
+            : (success ? new Color(120, 220, 120) : new Color(220, 120, 120));
         pg.roundRect(-panelW / 2, -panelH / 2, panelW, panelH, 28);
         pg.stroke();
         overlay.addChild(panel);
 
         // 标题
-        const titleText = success ? '通关!' : '游戏结束';
-        const titleColor = success ? new Color(150, 240, 150) : new Color(240, 150, 150);
+        const titleText = isQuit ? '本局结束' : (success ? '通关!' : '游戏结束');
+        const titleColor = isQuit
+            ? new Color(220, 220, 240)
+            : (success ? new Color(150, 240, 150) : new Color(240, 150, 150));
         const titleNode = createLabelNode(titleText, 80, titleColor);
         titleNode.setPosition(0, panelH * 0.28, 0);
         panel.addChild(titleNode);

@@ -204,6 +204,7 @@ export class Shooter extends Component {
 
     update(dt: number) {
         if (!this.deps) return;
+        if (this.locked) return;        // 暂停 / 游戏结束时冻结飞行更新
         const bounds = this.deps.bounds;
         const grid = this.deps.grid;
         const fx = this.deps.fx;
